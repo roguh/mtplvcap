@@ -252,6 +252,7 @@ func (d *DeviceGoUSB) RunTransactionWithNoParams(code uint16) error {
 // IDs, USB errors (BUSY, IO, ACCESS etc.), and receiving data for
 // operations that expect no data.
 func (d *DeviceGoUSB) RunTransaction(req *Container, rep *Container,
+	// TODO raise a disconnection error so that reconnection logic can be triggered
 	dest io.Writer, src io.Reader, writeSize int64) error {
 	if err := d.runTransaction(req, rep, dest, src, writeSize); err != nil {
 		_, ok2 := err.(SyncError)

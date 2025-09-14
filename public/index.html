@@ -3,8 +3,13 @@
 <body>
 <img id="lv" src="">
 <script>
+var socket = null;
+
+// Attempt to reconnect every X seconds
+var reconnectLoopSec = 0.1 * 1000;
+function connect() {
   var img = document.getElementById('lv');
-  var socket = new WebSocket("ws://" + window.location.host + "/stream");
+  socket = new WebSocket("ws://" + window.location.host + "/stream");
 
   socket.onopen = function () {
     console.log("Connected");
@@ -14,6 +19,18 @@
     console.log("Got frame");
     img.src = "data:image/jpeg;base64," + e.data;
   };
+
+  socket.onclose = function (ev) {
+    var msg = "Websocket is closed, attempting to reconnect every " + reconnectLoopSec / 1000 + " sec"
+    console.log(msg)
+    // Clear image
+    img.src = ""
+    socket = null;
+    setTimeout(connect, reconnectLoopSec);
+  };
+}
+
+window.onload = connect
 </script>
 </body>
 </html>

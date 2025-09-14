@@ -15,6 +15,15 @@ import (
 	"github.com/matishsiao/goInfo"
 )
 
+type DeviceDisconnectedError struct {
+	Message string
+	Code    uint16
+}
+
+func (e DeviceDisconnectedError) Error() string {
+	return e.Message
+}
+
 // DeviceDirect implements mtp.Device.
 // It accesses libusb driver via hanwen/usb.
 type DeviceDirect struct {
@@ -329,8 +338,8 @@ func (d *DeviceDirect) RunTransactionWithNoParams(code uint16) error {
 func (d *DeviceDirect) RunTransaction(req *Container, rep *Container,
 	dest io.Writer, src io.Reader, writeSize int64) error {
 	if d.h == nil {
-		return fmt.Errorf("mtp: cannot run operation %v, device is not open",
-			OC_names[int(req.Code)])
+		return DeviceDisconnectedError{fmt.Sprintf("mtp: cannot run operation %v, device is not open",
+			OC_names[int(req.Code)]), req.Code}
 	}
 	if err := d.runTransaction(req, rep, dest, src, writeSize); err != nil {
 		_, ok2 := err.(SyncError)
