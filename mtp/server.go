@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	// "syscall"
 	"time"
 
 	"go.uber.org/atomic"
@@ -52,20 +51,19 @@ type LVServer struct {
 
 	lrFPS *atomic.Int64
 
-	eg     *errgroup.Group
-	ctx    context.Context
-	subctx context.Context
-	cancel context.CancelFunc
+	eg  *errgroup.Group
+	ctx context.Context
 
-	DisconnectHandler func()
+	usbctx    context.Context
+	usbcancel context.CancelFunc
+
+	USBDisconnectHandler func()
 }
 
 func NewLVServer(ctx context.Context, dev Device, maxResolution bool, afInterval int64, lrFPS int64) *LVServer {
-	// eg, egCtx, cancel := errgroup.WithCancel(ctx)
-	// call s.cancel() and s.dev.Close() to cleanup
-	// reopen the device and restart a context when ready
 	eg, egCtx := errgroup.WithContext(ctx)
-	subctx, cancel := context.WithCancel(context.Background())
+	// This ctx allows us to cancel any periodic tasks related to the currently opened USB device
+	usbctx, usbcancel := context.WithCancel(context.Background())
 
 	afTicker := NewMutableTicker(time.Duration(afInterval) * time.Second)
 	if afInterval > 0 {
@@ -93,37 +91,38 @@ func NewLVServer(ctx context.Context, dev Device, maxResolution bool, afInterval
 
 		lrFPS: atomic.NewInt64(lrFPS),
 
-		eg:     eg,
-		ctx:    egCtx,
-		subctx: subctx,
-		cancel: cancel,
+		eg:  eg,
+		ctx: egCtx,
+
+		usbctx:               usbctx,
+		usbcancel:            usbcancel,
+		USBDisconnectHandler: nil,
 	}
 }
 
 // USB disconnect and reconnect
 
-func (s *LVServer) SetDisconnectHandler(DisconnectHandler func()) {
-	s.DisconnectHandler = DisconnectHandler
+func (s *LVServer) SetUSBDisconnectHandler(USBDisconnectHandler func()) {
+	s.USBDisconnectHandler = USBDisconnectHandler
 }
 
-func (s *LVServer) Cancel() {
-	log.LV.Infof("cancelling Run")
-	s.cancel()
+func (s *LVServer) USBClose() {
+	log.LV.Infof("Closing USB device")
+	s.usbcancel()
 	time.Sleep(time.Second)
 	if ddev, ok := s.dev.(*DeviceDirect); ok {
-		log.LV.Infof("closing USB")
 		ddev.Close()
 	}
 }
-func (s *LVServer) Reopen(ctx context.Context, dev Device) {
+func (s *LVServer) USBReopen(ctx context.Context, dev Device) {
 	s.dev = dev
 	s.dummy = dev == nil
 	eg, egCtx := errgroup.WithContext(ctx) // what happens to the old s.eg?
 	s.ctx = egCtx
 	s.eg = eg
-	subctx, cancel := context.WithCancel(context.Background())
-	s.subctx = subctx
-	s.cancel = cancel
+	usbctx, usbcancel := context.WithCancel(context.Background())
+	s.usbctx = usbctx
+	s.usbcancel = usbcancel
 }
 
 // HTTP handler / WebSocket
@@ -136,6 +135,7 @@ func (s *LVServer) HandleStream(w http.ResponseWriter, r *http.Request) {
 	defer ws.Close()
 
 	s.registerStreamClient(ws)
+	defer s.unregisterStreamClient(ws)
 	log.LV.Infof("HandleStream: client %s connected", ws.RemoteAddr())
 
 	// Read messages from the client
@@ -169,8 +169,6 @@ func (s *LVServer) HandleStream(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 	}
-
-	s.unregisterStreamClient(ws)
 }
 
 func (s *LVServer) registerStreamClient(c *websocket.Conn) {
@@ -384,7 +382,7 @@ func CloseWS(ws *websocket.Conn) error {
 	return nil
 }
 
-func (s *LVServer) Close() {
+func (s *LVServer) CloseWebsocketConnections() {
 	for ws := range s.streamClients {
 		log.LV.Infof("Closing stream client %s", ws.RemoteAddr())
 		if err := CloseWS(ws); err != nil {
@@ -477,9 +475,7 @@ func (s *LVServer) Run() error {
 	s.eg.Go(s.frameCaptorSakura)
 	s.eg.Go(s.workerBroadcastFrame)
 	s.eg.Go(s.workerBroadcastInfo)
-	result := s.eg.Wait()
-	log.LV.Infof("Run stopped: %s", result)
-	return result
+	return s.eg.Wait()
 }
 
 func (s *LVServer) workerLV() error {
@@ -491,7 +487,8 @@ func (s *LVServer) workerLV() error {
 			// let's go!
 		case <-s.ctx.Done():
 			return nil
-		case <-s.subctx.Done():
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		}
 
@@ -519,7 +516,8 @@ func (s *LVServer) workerAF() error {
 			// Do it now
 		case <-s.ctx.Done():
 			return nil
-		case <-s.subctx.Done():
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		}
 
@@ -553,7 +551,8 @@ func (s *LVServer) frameCaptorSakura() error {
 		select {
 		case <-s.ctx.Done():
 			return nil
-		case <-s.subctx.Done():
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		default:
 			// Let's go!
@@ -579,7 +578,6 @@ func (s *LVServer) frameCaptorSakura() error {
 				time.Sleep(time.Second)
 				continue
 			}
-
 		}
 		_, currentISO, err := s.getISOs()
 		if err != nil {
@@ -633,7 +631,8 @@ func (s *LVServer) workerBroadcastFrame() error {
 		select {
 		case <-s.ctx.Done():
 			return nil
-		case <-s.subctx.Done():
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		case <-s.newFrameChan:
 		}
@@ -676,7 +675,8 @@ func (s *LVServer) workerBroadcastInfo() error {
 		select {
 		case <-s.ctx.Done():
 			return nil
-		case <-s.subctx.Done():
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		case <-tick.C:
 			// Let's go!
@@ -994,13 +994,10 @@ func (s *LVServer) getLiveViewImgInner() (LiveView, error) {
 	err := s.dev.RunTransaction(&req, &rep, buf, nil, 0)
 	if err != nil {
 		if _, ok := err.(DeviceDisconnectedError); ok {
-			// send signal 15 interrupt to self
-			// this should trigger the process's shutdown logic to close websocket connections properly
-			// log.LV.Error("USB device disconnected, shutting down")
-			// syscall.Kill(syscall.Getpid(), syscall.SIGINT)
-			if s.DisconnectHandler != nil {
-				s.Cancel()
-				s.DisconnectHandler()
+			log.LV.Error("USB device is disconnected, attempting to reconnect")
+			if s.USBDisconnectHandler != nil {
+				s.USBClose()
+				s.USBDisconnectHandler()
 			}
 			return LiveView{}, fmt.Errorf("failed to obtain an image: %s", err)
 		}

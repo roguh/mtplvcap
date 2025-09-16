@@ -127,13 +127,13 @@ func main() {
 			if err = newDev.Configure(); err != nil {
 				log.Fatalf("configure failed: %v", err)
 			}
-			lvs.Reopen(ctx, newDev)
+			lvs.USBReopen(ctx, newDev)
 			break
 		}
 		time.Sleep(2 * time.Second)
 		eg.Go(lvs.Run)
 	}
-	lvs.SetDisconnectHandler(Reconnect)
+	lvs.SetUSBDisconnectHandler(Reconnect)
 
 	router := http.NewServeMux()
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +168,7 @@ func main() {
 		case <-ctx.Done():
 		}
 		ctx, _ := context.WithTimeout(context.Background(), 3*time.Second)
-		lvs.Close()
+		lvs.CloseWebsocketConnections()
 		return srv.Shutdown(ctx)
 	})
 
@@ -180,10 +180,6 @@ func main() {
 
 	err = eg.Wait()
 	if err != nil {
-		if err.Error() == "interrupt" {
-			log.Info("shutting down")
-			return
-		}
 		log.Error(err)
 	}
 }
