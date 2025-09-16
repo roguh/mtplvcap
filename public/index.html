@@ -6,8 +6,8 @@
 var socket = null;
 
 // Attempt to reconnect every X seconds
-var reconnectLoopSec = 0.1 * 1000;
-function connect() {
+var reconnectSec = 0.1 * 1000;
+function connectWebsocket() {
   var img = document.getElementById('lv');
   socket = new WebSocket("ws://" + window.location.host + "/stream");
 
@@ -21,16 +21,18 @@ function connect() {
   };
 
   socket.onclose = function (ev) {
-    var msg = "Websocket is closed, attempting to reconnect every " + reconnectLoopSec / 1000 + " sec"
+    var msg = "Websocket is closed, attempting to reconnect every " + reconnectSec / 1000 + " sec"
     console.log(msg)
     // Clear image
     img.src = ""
     socket = null;
-    setTimeout(connect, reconnectLoopSec);
+    setTimeout(connectWebsocket, reconnectSec);
   };
 }
 
-window.onload = connect
+window.onload = function() {
+  connectWebsocket();
+}
 </script>
 </body>
 </html>
