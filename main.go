@@ -146,7 +146,7 @@ func main() {
 	log.Info("started")
 
 	if *afFocusNow > 0 {
-		lvs.AFFocusAfter(time.Duration(*afFocusNow) * time.Second)
+		go lvs.AFFocusAfter(time.Duration(*afFocusNow) * time.Second)
 	}
 
 	err = eg.Wait()

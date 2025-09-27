@@ -143,22 +143,19 @@ type InfoPayload struct {
 	Frame  []byte   `json:"frame"`
 }
 
-func (s *LVServer) AFFocusNow() {
-	log.LV.Info("AFFocusNow: focus now")
+func (s *LVServer) AFFocusAfter(after time.Duration) {
+	select {
+	case <-time.After(after):
+	case <-s.ctx.Done():
+		return
+	}
+
+	log.LV.Info("AFFocusAfter: focusing now")
 	select {
 	case s.afNowChan <- true:
-	default:
+	case <-s.ctx.Done():
+		return
 	}
-}
-
-func (s *LVServer) AFFocusAfter(after time.Duration) {
-	go func() {
-		select {
-		case <-time.After(after):
-			s.AFFocusNow()
-		case <-s.ctx.Done():
-		}
-	}()
 }
 
 func (s *LVServer) HandleControl(w http.ResponseWriter, r *http.Request) {
