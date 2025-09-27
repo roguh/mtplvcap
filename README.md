@@ -351,9 +351,9 @@ I strongly recommend you to compile by yourself for Linux distributions as Linux
 ```sh
 $ ./mtplvcap -help
 Usage of ./mtplvcap:
-  -af-focus-now int
+  -autofocus-on-startup int
         autofocus once on startup after X seconds, default=0 (disabled)
-  -af-interval int
+  -autofocus-interval int
         disable or change the autofocus interval in seconds, default=0 (disabled)
   -backend-go
         force gousb as libusb wrapper (not recommended)
