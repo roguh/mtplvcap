@@ -44,7 +44,12 @@
   </style>
 </head>
 <body>
-<div class="container top-container">
+  <!-- Show a bootstrap error message at the top of the page -->
+  <div id="error-message" class="alert alert-danger hidden" role="alert">
+    Loading...
+  </div>
+
+  <div class="container top-container">
   <div class="row">
     <div class="col-md-4 mb-3">
       <div class="card">
@@ -120,7 +125,7 @@
             </tr>
             </tbody>
           </table>
-          <img id="preview" src="" alt="preview">
+          <img id="preview" src="" alt="no preview received">
         </div>
       </div>
     </div>
@@ -129,12 +134,36 @@
 <script>
   var first = true;
   var img = document.getElementById('lv');
-  var socket = new WebSocket("ws://" + window.location.host + "/control");
+  var socket = null;
   var isos = new Array(0);
   var fns = new Array(0);
 
+// Attempt to reconnect every X seconds
+var reconnectSec = 1 * 1000;
+function connectWebsocket() {
+  first = true;
+  socket = new WebSocket("ws://" + window.location.host + "/control");
+
   socket.onopen = function () {
     console.log("Connected");
+
+    // Turn off error
+    $("#error-message").addClass("invisible");
+    $("#error-message").text("");
+  };
+  socket.onclose = function (ev) {
+    var msg = "Websocket is closed, attempting to reconnect every " + reconnectSec / 1000 + " sec"
+    // Turn off preview
+    $("#preview").attr("src", "");
+
+    // Show error
+    $("#error-message").removeClass("invisible");
+    $("#error-message").text(msg);
+    socket = null;
+    setTimeout(connectWebsocket, reconnectSec);
+  };
+  socket.onerror = function (ev) {
+    console.log("Websocket error:", ev);
   };
 
   socket.onmessage = function (e) {
@@ -166,9 +195,11 @@
       first = false;
     }
   };
+}
 
+function setupHandlers() {
   $('#af').change(function(){
-    if (first) {
+    if (first || !socket) {
       return;
     }
     let interval = $(this).prop('checked') ? parseInt($("#af-interval").val(), 10) : 0;
@@ -178,7 +209,7 @@
   });
 
   $('#lr').change(function(){
-    if (first) {
+    if (first || !socket) {
       return;
     }
     let fps = $(this).prop('checked') ? parseInt($("#lr-fps").val(), 10) : 0;
@@ -188,6 +219,9 @@
   });
 
   $("#af-now").on("click", function(){
+    if (!socket) {
+      return;
+    }
     socket.send(JSON.stringify({
       "af_focus_now": true,
     }));
@@ -195,6 +229,9 @@
 
   let $iso = $("#iso");
   $iso.on("input change", function(){
+    if (!socket) {
+      return;
+    }
     let chose = isos[parseInt($iso.val())];
     $("#iso-label").html(`ISO ${chose}`);
     socket.send(JSON.stringify({
@@ -204,12 +241,21 @@
 
   let $fn = $("#fn");
   $fn.on("input keyup", function(){
+    if (!socket) {
+      return;
+    }
     let chose = fns[$fn.val()];
     $("#fn-label").html(`F ${chose}`);
     socket.send(JSON.stringify({
       "fn": chose,
     }))
   });
+}
+
+window.onload = function() {
+  setupHandlers();
+  connectWebsocket();
+}
 </script>
 </body>
 </html>

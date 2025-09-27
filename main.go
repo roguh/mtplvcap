@@ -61,23 +61,30 @@ func main() {
 
 	var dev mtp.Device
 
-	if *serverOnly {
-		log.Info("server-only mode is activated, skipping USB initialization")
-	} else {
+	for {
+		// TODO put this loop into its own function, e.g. retryopen
+		if *serverOnly {
+			log.Info("server-only mode is activated, skipping USB initialization")
+			break
+		}
 		if *backendGo {
 			ctx := gousb.NewContext()
 			defer ctx.Close()
 
 			devGo, err := mtp.SelectDeviceGoUSB(ctx, uint16(vid), uint16(pid))
 			if err != nil {
-				log.Fatalf("failed to detect MTP device: %s", err)
+				log.Warningf("failed to detect MTP device: %s", err)
+				time.Sleep(time.Second)
+				continue
 			}
 			defer devGo.Close()
 			dev = devGo
 		} else {
 			devDirect, err := mtp.SelectDeviceDirect(uint16(vid), uint16(pid))
 			if err != nil {
-				log.Fatalf("failed to detect MTP devices: %v", err)
+				log.Warningf("failed to detect MTP devices: %v", err)
+				time.Sleep(time.Second)
+				continue
 			}
 			defer devDirect.Close()
 			dev = devDirect
@@ -86,6 +93,7 @@ func main() {
 		if err = dev.Configure(); err != nil {
 			log.Fatalf("configure failed: %v", err)
 		}
+		break
 	}
 
 	eg, ctx := errgroup.WithContext(context.Background())
@@ -106,6 +114,26 @@ func main() {
 
 	lvs := mtp.NewLVServer(ctx, dev, *maxResolution, *afInterval, *fps)
 	eg.Go(lvs.Run)
+	Reconnect := func() {
+		log.Infof("Reconnecting to USB device")
+		for {
+			newDevDirect, err := mtp.SelectDeviceDirect(uint16(vid), uint16(pid))
+			if err != nil {
+				log.Warningf("failed to detect MTP devices: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+			newDev := newDevDirect
+			if err = newDev.Configure(); err != nil {
+				log.Fatalf("configure failed: %v", err)
+			}
+			lvs.USBReopen(ctx, newDev)
+			break
+		}
+		time.Sleep(2 * time.Second)
+		eg.Go(lvs.Run)
+	}
+	lvs.SetUSBDisconnectHandler(Reconnect)
 
 	router := http.NewServeMux()
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +168,7 @@ func main() {
 		case <-ctx.Done():
 		}
 		ctx, _ := context.WithTimeout(context.Background(), 3*time.Second)
+		lvs.CloseWebsocketConnections()
 		return srv.Shutdown(ctx)
 	})
 

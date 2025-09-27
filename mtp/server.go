@@ -53,10 +53,17 @@ type LVServer struct {
 
 	eg  *errgroup.Group
 	ctx context.Context
+
+	usbctx    context.Context
+	usbcancel context.CancelFunc
+
+	USBDisconnectHandler func()
 }
 
 func NewLVServer(ctx context.Context, dev Device, maxResolution bool, afInterval int64, lrFPS int64) *LVServer {
 	eg, egCtx := errgroup.WithContext(ctx)
+	// This ctx allows us to cancel any periodic tasks related to the currently opened USB device
+	usbctx, usbcancel := context.WithCancel(context.Background())
 
 	afTicker := NewMutableTicker(time.Duration(afInterval) * time.Second)
 	if afInterval > 0 {
@@ -86,7 +93,36 @@ func NewLVServer(ctx context.Context, dev Device, maxResolution bool, afInterval
 
 		eg:  eg,
 		ctx: egCtx,
+
+		usbctx:               usbctx,
+		usbcancel:            usbcancel,
+		USBDisconnectHandler: nil,
 	}
+}
+
+// USB disconnect and reconnect
+
+func (s *LVServer) SetUSBDisconnectHandler(USBDisconnectHandler func()) {
+	s.USBDisconnectHandler = USBDisconnectHandler
+}
+
+func (s *LVServer) USBClose() {
+	log.LV.Infof("Closing USB device")
+	s.usbcancel()
+	time.Sleep(time.Second)
+	if ddev, ok := s.dev.(*DeviceDirect); ok {
+		ddev.Close()
+	}
+}
+func (s *LVServer) USBReopen(ctx context.Context, dev Device) {
+	s.dev = dev
+	s.dummy = dev == nil
+	eg, egCtx := errgroup.WithContext(ctx) // what happens to the old s.eg?
+	s.ctx = egCtx
+	s.eg = eg
+	usbctx, usbcancel := context.WithCancel(context.Background())
+	s.usbctx = usbctx
+	s.usbcancel = usbcancel
 }
 
 // HTTP handler / WebSocket
@@ -99,13 +135,38 @@ func (s *LVServer) HandleStream(w http.ResponseWriter, r *http.Request) {
 	defer ws.Close()
 
 	s.registerStreamClient(ws)
+	defer s.unregisterStreamClient(ws)
+	log.LV.Infof("HandleStream: client %s connected", ws.RemoteAddr())
+
+	// Read messages from the client
 	for {
-		var mes struct{}
-		err := ws.ReadJSON(&mes)
+		messageType, message, err := ws.ReadMessage()
 		if err != nil {
-			log.LV.Errorf("HandleStream: failed to read a message: %s", err)
-			s.unregisterStreamClient(ws)
-			return
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.LV.Infof("HandleStream: client %s closed normally", ws.RemoteAddr())
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.LV.Warningf("HandleStream: client %s closed unexpectedly: %s", ws.RemoteAddr(), err)
+			} else {
+				log.LV.Warningf("HandleStream: client %s error: %s", ws.RemoteAddr(), err)
+			}
+			break
+		}
+
+		// Handle different message types
+		switch messageType {
+		case websocket.TextMessage:
+			// Process JSON message - only receiving empty objects
+			var payload map[string]interface{}
+			if err := json.Unmarshal(message, &payload); err != nil {
+				log.LV.Errorf("HandleStream: invalid JSON: %s", err)
+				continue
+			}
+		case websocket.BinaryMessage:
+			log.LV.Warningf("HandleStream: unexpected binary message, %d bytes", len(message))
+			continue
+		default:
+			log.LV.Warningf("HandleStream: unknown message type: %d", messageType)
+			continue
 		}
 	}
 }
@@ -177,23 +238,49 @@ func (s *LVServer) HandleControl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.registerControlClient(ws)
+	defer s.unregisterControlClient(ws)
+	log.LV.Infof("HandleControl: client %s connected", ws.RemoteAddr())
+
+	// Read messages from the client
 	for {
 		var p ControlPayload
-		err := ws.ReadJSON(&p)
+
+		messageType, message, err := ws.ReadMessage()
 		if err != nil {
-			log.LV.Errorf("HandleControl: failed to read a message: %s", err)
-			s.unregisterControlClient(ws)
-			return
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.LV.Infof("HandleControl: client %s closed normally", ws.RemoteAddr())
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.LV.Warningf("HandleControl: client %s closed unexpectedly: %s", ws.RemoteAddr(), err)
+			} else {
+				log.LV.Warningf("HandleControl: client %s error: %s", ws.RemoteAddr(), err)
+			}
+			break
+		}
+
+		// Handle different message types
+		switch messageType {
+		case websocket.TextMessage:
+			// Process JSON message
+			if err := json.Unmarshal(message, &p); err != nil {
+				log.LV.Errorf("HandleControl: client %s invalid JSON: %s", ws.RemoteAddr(), err)
+				continue
+			}
+		case websocket.BinaryMessage:
+			log.LV.Warningf("HandleControl: client %s unexpected binary message, %d bytes", ws.RemoteAddr(), len(message))
+			continue
+		default:
+			log.LV.Warningf("HandleControl: client %s unknown message type: %d", ws.RemoteAddr(), messageType)
+			continue
 		}
 
 		if p.AFInterval != nil {
 			setInfo(p.AFInterval, nil)
 
 			if *p.AFInterval > 0 {
-				log.LV.Debug("HandleControl: enable AF")
+				log.LV.Debugf("HandleControl: client %s enable AF", ws.RemoteAddr())
 				s.afTicker.Start()
 			} else {
-				log.LV.Debug("HandleControl: disable AF")
+				log.LV.Debugf("HandleControl: client %s disable AF", ws.RemoteAddr())
 				s.afTicker.Stop()
 				continue
 			}
@@ -201,13 +288,13 @@ func (s *LVServer) HandleControl(w http.ResponseWriter, r *http.Request) {
 			s.afInterval.Store(*p.AFInterval)
 			s.afTicker.SetInterval(time.Duration(*p.AFInterval) * time.Second)
 			if err != nil {
-				log.LV.Debugf("HandleControl: failed to set interval: %d", *p.AFInterval)
+				log.LV.Debugf("HandleControl: client %s failed to set interval: %d", ws.RemoteAddr(), *p.AFInterval)
 			}
-			log.LV.Debugf("HandleControl: set AF interval: %d", *p.AFInterval)
+			log.LV.Debugf("HandleControl: client %s set AF interval: %d", ws.RemoteAddr(), *p.AFInterval)
 		}
 
 		if p.AFFocusNow != nil && *p.AFFocusNow {
-			log.LV.Debug("HandleControl: focus now")
+			log.LV.Debugf("HandleControl: client %s focus now", ws.RemoteAddr())
 			select {
 			case s.afNowChan <- true:
 			default:
@@ -217,26 +304,26 @@ func (s *LVServer) HandleControl(w http.ResponseWriter, r *http.Request) {
 		if p.LRFPS != nil {
 			setInfo(nil, p.LRFPS)
 			if *p.LRFPS > 0 {
-				log.LV.Debugf("HandleControl: set rate limit: %d", *p.LRFPS)
+				log.LV.Debugf("HandleControl: client %s set rate limit: %d", ws.RemoteAddr(), *p.LRFPS)
 			} else {
-				log.LV.Debug("HandleControl: disable rate limit")
+				log.LV.Debugf("HandleControl: client %s disable rate limit", ws.RemoteAddr())
 			}
 			s.lrFPS.Store(*p.LRFPS)
 		}
 
 		if p.ISO != nil {
-			log.LV.Debugf("HandleControl: set ISO: %d", *p.ISO)
+			log.LV.Debugf("HandleControl: client %s set ISO: %d", ws.RemoteAddr(), *p.ISO)
 			err = s.setISO(*p.ISO)
 			if err != nil {
-				log.LV.Errorf("HandleControl: failed to set ISO: %s", err)
+				log.LV.Errorf("HandleControl: client %s failed to set ISO: %s", ws.RemoteAddr(), err)
 			}
 		}
 
 		if p.FN != nil {
-			log.LV.Debugf("HandleControl: set f-number: %s", *p.FN)
+			log.LV.Debugf("HandleControl: client %s set f-number: %s", ws.RemoteAddr(), *p.FN)
 			err = s.setFN(*p.FN)
 			if err != nil {
-				log.LV.Errorf("HandleControl: failed to set f-number: %s", err)
+				log.LV.Errorf("HandleControl: client %s failed to set f-number: %s", ws.RemoteAddr(), err)
 			}
 		}
 	}
@@ -254,6 +341,58 @@ func (s *LVServer) unregisterControlClient(c *websocket.Conn) {
 	delete(s.controlClients, c)
 }
 
+func CloseWS(ws *websocket.Conn) error {
+	// This function closes a websocket connection and its underlying TCP connection
+
+	// Wait X seconds to write the close request
+	deadline := time.Now().Add(5 * time.Second)
+	// Send a WebSocket close control message
+	err := ws.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		deadline,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Wait X seconds to receive the close response
+	err = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err != nil {
+		return err
+	}
+	// Read messages until the close message is confirmed
+	for {
+		_, _, err = ws.NextReader()
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+	// Close the TCP connection
+	err = ws.Close()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *LVServer) CloseWebsocketConnections() {
+	for ws := range s.streamClients {
+		log.LV.Infof("Closing stream client %s", ws.RemoteAddr())
+		if err := CloseWS(ws); err != nil {
+			log.LV.Warningf("SendClose: failed to close websocket: %s", err)
+		}
+	}
+	for ws := range s.controlClients {
+		log.LV.Infof("Closing control client %s", ws.RemoteAddr())
+		if err := CloseWS(ws); err != nil {
+			log.LV.Warningf("SendClose: failed to close websocket: %s", err)
+		}
+	}
+}
 func (s *LVServer) HandleMotionJPEG(w http.ResponseWriter, r *http.Request) {
 	log.LV.Info("handling GET /mjpeg")
 
@@ -345,6 +484,9 @@ func (s *LVServer) workerLV() error {
 			// let's go!
 		case <-s.ctx.Done():
 			return nil
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
+			return nil
 		}
 
 		status, err := s.getLiveViewStatus()
@@ -370,6 +512,9 @@ func (s *LVServer) workerAF() error {
 		case <-s.afNowChan:
 			// Do it now
 		case <-s.ctx.Done():
+			return nil
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		}
 
@@ -402,6 +547,9 @@ func (s *LVServer) frameCaptorSakura() error {
 	for {
 		select {
 		case <-s.ctx.Done():
+			return nil
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		default:
 			// Let's go!
@@ -480,6 +628,9 @@ func (s *LVServer) workerBroadcastFrame() error {
 		select {
 		case <-s.ctx.Done():
 			return nil
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
+			return nil
 		case <-s.newFrameChan:
 		}
 
@@ -520,6 +671,9 @@ func (s *LVServer) workerBroadcastInfo() error {
 	for {
 		select {
 		case <-s.ctx.Done():
+			return nil
+		case <-s.usbctx.Done():
+			// cancel tasks related to USB device
 			return nil
 		case <-tick.C:
 			// Let's go!
@@ -836,6 +990,14 @@ func (s *LVServer) getLiveViewImgInner() (LiveView, error) {
 	req.Param = []uint32{}
 	err := s.dev.RunTransaction(&req, &rep, buf, nil, 0)
 	if err != nil {
+		if _, ok := err.(DeviceDisconnectedError); ok {
+			log.LV.Error("USB device is disconnected, attempting to reconnect")
+			if s.USBDisconnectHandler != nil {
+				s.USBClose()
+				s.USBDisconnectHandler()
+			}
+			return LiveView{}, fmt.Errorf("failed to obtain an image: %s", err)
+		}
 		if casted, ok := err.(RCError); ok && uint16(casted) == RC_NIKON_NotLiveView {
 			return LiveView{}, fmt.Errorf("failed to obtain an image: live view is not activated")
 		}
